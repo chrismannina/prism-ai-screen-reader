@@ -59,6 +59,13 @@ class MLSettings:
     local_model_path: str = "models/"
     use_cloud_models: bool = False
     batch_classification: bool = True
+    
+    # Vision-based classification settings
+    use_vision_classification: bool = True
+    openai_api_key: str = field(default_factory=lambda: os.getenv('OPENAI_API_KEY', ''))
+    vision_model: str = "gpt-4o-mini"
+    vision_confidence_threshold: float = 0.7
+    fallback_to_text_classification: bool = True
 
 
 @dataclass

@@ -8,6 +8,7 @@ Coordinates all components and provides CLI interface.
 import asyncio
 import signal
 import sys
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -16,8 +17,8 @@ import click
 from loguru import logger
 
 from .core.config import PrismConfig
+from .core.database import DatabaseManager, WindowInfo, Screenshot
 from .core.event_bus import EventBus, EventType, get_event_bus
-from .core.database import DatabaseManager
 from .core.security import SecurityManager
 from .agents.observer import ObserverAgent
 
@@ -312,16 +313,13 @@ def cleanup(ctx, days):
 
 
 @cli.command()
-@click.pass_context
-def init(ctx):
+def init():
     """Initialize Prism configuration and database."""
-    config_file = ctx.obj.get('config')
-    
     try:
         click.echo("🔧 Initializing Prism...")
         
-        # Create config
-        config = PrismConfig(config_file)
+        # Initialize configuration
+        config = PrismConfig()
         config.save_config()
         
         # Initialize database
@@ -330,18 +328,253 @@ def init(ctx):
         # Initialize security
         security_manager = SecurityManager(config)
         
+        logger.info("Prism initialization completed successfully")
         click.echo("✅ Prism initialized successfully!")
         click.echo(f"Config saved to: {config.config_file}")
         click.echo(f"Database initialized at: {config.get_data_directory()}")
-        
-        # Show next steps
-        click.echo("\n📋 Next Steps:")
+        click.echo()
+        click.echo("📋 Next Steps:")
         click.echo("1. Grant screen recording permissions (System Preferences > Privacy)")
         click.echo("2. Install Tesseract OCR: brew install tesseract")
-        click.echo("3. Run: python -m prism.main start")
+        click.echo("3. Run: prism start")
         
     except Exception as e:
+        logger.error(f"Initialization failed: {e}")
         click.echo(f"❌ Initialization failed: {e}")
+        raise click.Abort()
+
+
+@cli.command()
+@click.option('--detailed', '-d', is_flag=True, help='Show detailed activity breakdown')
+@click.option('--hours', '-h', default=24, help='Hours of history to show (default: 24)')
+@click.option('--limit', '-l', default=20, help='Limit number of activities shown (default: 20)')
+@click.option('--show-ocr', is_flag=True, help='Show OCR text content')
+def report(detailed, hours, limit, show_ocr):
+    """Generate a detailed report of captured data."""
+    try:
+        config = PrismConfig()
+        database = DatabaseManager(config)
+        
+        click.echo("📊 Prism Activity Report")
+        click.echo("=" * 50)
+        
+        # Get database statistics
+        db_stats = database.get_database_stats()
+        click.echo(f"🗄️  Database Overview:")
+        click.echo(f"   Screenshots: {db_stats.get('screenshots_count', 0):,}")
+        click.echo(f"   Activities: {db_stats.get('activities_count', 0):,}")
+        click.echo(f"   Window Records: {db_stats.get('window_info_count', 0):,}")
+        click.echo(f"   Database Size: {db_stats.get('database_size_mb', 0):.1f} MB")
+        click.echo()
+        
+        # Get recent activities
+        activities = database.get_recent_activities(limit=limit, hours_back=hours)
+        
+        if not activities:
+            click.echo("🔍 No activities found in the specified time range.")
+            return
+        
+        click.echo(f"📈 Recent Activities (Last {hours} hours, showing {len(activities)} of {limit}):")
+        click.echo("-" * 80)
+        
+        for i, activity in enumerate(activities, 1):
+            timestamp = activity.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            confidence_icon = "🟢" if activity.confidence > 0.7 else "🟡" if activity.confidence > 0.5 else "🔴"
+            
+            click.echo(f"{i:2d}. {timestamp} | {confidence_icon} {activity.activity_type:<12} | {activity.confidence:.1%}")
+            
+            if detailed:
+                # Show metadata if available
+                if activity.activity_metadata:
+                    import json
+                    try:
+                        metadata = json.loads(activity.activity_metadata) if isinstance(activity.activity_metadata, str) else activity.activity_metadata
+                        if 'all_scores' in metadata:
+                            scores = metadata['all_scores']
+                            top_3 = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:3]
+                            score_str = " | ".join([f"{k}: {v:.2f}" for k, v in top_3])
+                            click.echo(f"     Scores: {score_str}")
+                    except:
+                        pass
+                
+                # Show window info if available
+                try:
+                    if hasattr(activity, 'window_info_id') and activity.window_info_id:
+                        # Get window info separately to avoid session issues
+                        with database.get_session() as session:
+                            window_info = session.get(WindowInfo, activity.window_info_id)
+                            if window_info:
+                                click.echo(f"     App: {window_info.app_name}")
+                                if window_info.window_title != window_info.app_name:
+                                    click.echo(f"     Window: {window_info.window_title}")
+                except:
+                    pass
+                
+                # Show screenshot info if available
+                try:
+                    if hasattr(activity, 'screenshot_id') and activity.screenshot_id:
+                        # Get screenshot info separately to avoid session issues
+                        with database.get_session() as session:
+                            screenshot = session.get(Screenshot, activity.screenshot_id)
+                            if screenshot:
+                                resolution = f"{screenshot.resolution_width}x{screenshot.resolution_height}"
+                                size_kb = screenshot.file_size_bytes / 1024
+                                click.echo(f"     Screenshot: {resolution} ({size_kb:.1f} KB)")
+                                if show_ocr and screenshot.ocr_text:
+                                    # Show first 200 characters of OCR text
+                                    ocr_preview = screenshot.ocr_text[:200] + "..." if len(screenshot.ocr_text) > 200 else screenshot.ocr_text
+                                    click.echo(f"     OCR Text: {ocr_preview}")
+                                elif screenshot.ocr_text and not show_ocr:
+                                    click.echo(f"     OCR Text: {len(screenshot.ocr_text)} characters (use --show-ocr to view)")
+                except:
+                    pass
+                
+                click.echo()
+        
+        # Get daily summary
+        summary = database.get_daily_summary()
+        if summary:
+            click.echo("📊 Today's Summary:")
+            click.echo("-" * 30)
+            total_minutes = summary.get('total_duration_seconds', 0) // 60
+            click.echo(f"Total Active Time: {total_minutes} minutes")
+            click.echo(f"Total Activities: {summary.get('total_activities', 0)}")
+            
+            if summary.get('activity_breakdown'):
+                click.echo("\nActivity Breakdown:")
+                total_duration = summary.get('total_duration_seconds', 0)
+                for activity_type, data in summary['activity_breakdown'].items():
+                    duration_min = data['duration'] // 60
+                    percentage = (data['duration'] / total_duration * 100) if total_duration > 0 else 0
+                    click.echo(f"  {activity_type.title()}: {duration_min}m ({percentage:.1f}%) - {data['count']} sessions")
+        
+        database.close()
+        
+    except Exception as e:
+        logger.error(f"Report generation failed: {e}")
+        click.echo(f"❌ Report generation failed: {e}")
+        raise click.Abort()
+
+
+@cli.command()
+@click.option('--limit', '-l', default=10, help='Number of screenshots to show (default: 10)')
+@click.option('--save-to', '-s', help='Directory to save screenshots to')
+@click.option('--open-viewer', '-o', is_flag=True, help='Open screenshots in default image viewer')
+def screenshots(limit, save_to, open_viewer):
+    """View and extract screenshots from the database."""
+    try:
+        config = PrismConfig()
+        database = DatabaseManager(config)
+        security_manager = SecurityManager(config)
+        
+        click.echo("📸 Prism Screenshots")
+        click.echo("=" * 40)
+        
+        # Get recent screenshots
+        with database.get_session() as session:
+            screenshots_data = session.query(Screenshot).order_by(Screenshot.timestamp.desc()).limit(limit).all()
+            
+            if not screenshots_data:
+                click.echo("🔍 No screenshots found.")
+                return
+            
+            click.echo(f"Found {len(screenshots_data)} screenshots:")
+            click.echo("-" * 50)
+            
+            for i, screenshot in enumerate(screenshots_data, 1):
+                timestamp = screenshot.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                resolution = f"{screenshot.resolution_width}x{screenshot.resolution_height}"
+                size_kb = screenshot.file_size_bytes / 1024
+                encrypted_icon = "🔒" if screenshot.is_encrypted else "🔓"
+                
+                click.echo(f"{i:2d}. {timestamp} | {resolution} | {size_kb:6.1f} KB | {encrypted_icon}")
+                
+                if screenshot.ocr_text:
+                    ocr_preview = screenshot.ocr_text[:60] + "..." if len(screenshot.ocr_text) > 60 else screenshot.ocr_text
+                    click.echo(f"    OCR: {ocr_preview}")
+                
+                # Save screenshot if requested
+                if save_to:
+                    saved_path = _save_screenshot(screenshot, save_to, security_manager, i)
+                    if saved_path:
+                        click.echo(f"    💾 Saved: {saved_path}")
+                        
+                        # Open in viewer if requested
+                        if open_viewer:
+                            _open_screenshot(saved_path)
+                
+                click.echo()
+        
+        if save_to:
+            click.echo(f"✅ Screenshots saved to: {save_to}")
+            if open_viewer:
+                click.echo("🖼️  Opening screenshots in default viewer...")
+        
+        database.close()
+        
+    except Exception as e:
+        logger.error(f"Screenshot viewing failed: {e}")
+        click.echo(f"❌ Screenshot viewing failed: {e}")
+        raise click.Abort()
+
+
+def _save_screenshot(screenshot, save_dir: str, security_manager, index: int) -> Optional[str]:
+    """Save a screenshot to disk."""
+    try:
+        import os
+        from PIL import Image
+        import io
+        
+        # Create save directory
+        save_path = Path(save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+        
+        # Get image data
+        image_data = screenshot.image_data
+        if not image_data:
+            logger.warning(f"No image data for screenshot {screenshot.id}")
+            return None
+        
+        # Decrypt if necessary
+        if screenshot.is_encrypted:
+            image_data = security_manager.decrypt_data(image_data)
+            if image_data is None:
+                logger.error(f"Failed to decrypt screenshot {screenshot.id}")
+                return None
+        
+        # Create filename
+        timestamp_str = screenshot.timestamp.strftime("%Y%m%d_%H%M%S")
+        filename = f"prism_screenshot_{index:02d}_{timestamp_str}.png"
+        file_path = save_path / filename
+        
+        # Load and save image
+        image = Image.open(io.BytesIO(image_data))
+        image.save(file_path, 'PNG')
+        
+        return str(file_path)
+        
+    except Exception as e:
+        logger.error(f"Error saving screenshot: {e}")
+        return None
+
+
+def _open_screenshot(file_path: str) -> None:
+    """Open screenshot in default image viewer."""
+    try:
+        import subprocess
+        import sys
+        
+        if sys.platform.startswith('darwin'):  # macOS
+            subprocess.run(['open', file_path])
+        elif sys.platform.startswith('linux'):  # Linux
+            subprocess.run(['xdg-open', file_path])
+        elif sys.platform.startswith('win'):  # Windows
+            subprocess.run(['start', file_path], shell=True)
+        else:
+            logger.warning(f"Unknown platform {sys.platform}, cannot open image viewer")
+            
+    except Exception as e:
+        logger.error(f"Error opening screenshot: {e}")
 
 
 def _check_permissions() -> bool:
@@ -354,6 +587,150 @@ def _check_permissions() -> bool:
     except Exception as e:
         logger.error(f"Permission check failed: {e}")
         return False
+
+
+@cli.command()
+@click.option('--host', default='127.0.0.1', help='Host to bind to (default: 127.0.0.1)')
+@click.option('--port', default=5000, help='Port to bind to (default: 5000)')
+@click.option('--debug', is_flag=True, help='Enable debug mode')
+@click.pass_context
+def dashboard(ctx, host, port, debug):
+    """Launch the Prism web dashboard."""
+    try:
+        from .web_dashboard import PrismWebDashboard
+        
+        config_file = ctx.obj.get('config')
+        web_dashboard = PrismWebDashboard(PrismConfig(config_file) if config_file else None)
+        
+        click.echo("🌐 Starting Prism Web Dashboard...")
+        click.echo(f"📱 Dashboard will be available at: http://{host}:{port}")
+        click.echo("🔄 Press Ctrl+C to stop the dashboard")
+        
+        web_dashboard.run(host=host, port=port, debug=debug)
+        
+    except ImportError as e:
+        click.echo(f"❌ Web dashboard dependencies missing: {e}")
+        click.echo("💡 Install with: pip install flask flask-socketio")
+        raise click.Abort()
+    except Exception as e:
+        click.echo(f"❌ Failed to start web dashboard: {e}")
+        raise click.Abort()
+
+
+@cli.command()
+def diagnose():
+    """Diagnose Prism permissions and screenshot capabilities."""
+    try:
+        click.echo("🔍 Prism Diagnostic Tool")
+        click.echo("=" * 40)
+        
+        # Test basic screenshot capability
+        click.echo("\n📸 Testing Screenshot Capability:")
+        try:
+            import pyautogui
+            test_screenshot = pyautogui.screenshot()
+            click.echo(f"✅ Basic screenshot successful: {test_screenshot.size}")
+            
+            # Check if screenshot contains actual content or just background
+            # Convert to numpy array to analyze pixel diversity
+            import numpy as np
+            img_array = np.array(test_screenshot)
+            
+            # Calculate color diversity (more colors = likely capturing applications)
+            unique_colors = len(np.unique(img_array.reshape(-1, img_array.shape[-1]), axis=0))
+            total_pixels = img_array.shape[0] * img_array.shape[1]
+            color_diversity = unique_colors / total_pixels
+            
+            click.echo(f"🎨 Color diversity: {color_diversity:.6f} ({unique_colors:,} unique colors)")
+            
+            if color_diversity < 0.001:
+                click.echo("⚠️  WARNING: Very low color diversity - likely only capturing desktop background")
+                click.echo("   This suggests insufficient screen recording permissions.")
+            else:
+                click.echo("✅ Good color diversity - appears to be capturing actual content")
+                
+        except Exception as e:
+            click.echo(f"❌ Screenshot test failed: {e}")
+        
+        # Test window detection
+        click.echo("\n🪟 Testing Window Detection:")
+        try:
+            from .agents.observer import WindowDetector
+            config = PrismConfig()
+            window_detector = WindowDetector(config)
+            window_info = window_detector.get_active_window_info()
+            
+            if window_info:
+                click.echo(f"✅ Active window detected:")
+                click.echo(f"   App: {window_info['app_name']}")
+                click.echo(f"   Window: {window_info['window_title']}")
+                click.echo(f"   Bundle ID: {window_info.get('bundle_id', 'N/A')}")
+            else:
+                click.echo("❌ No active window detected")
+                
+        except Exception as e:
+            click.echo(f"❌ Window detection test failed: {e}")
+        
+        # Test OCR capability
+        click.echo("\n📝 Testing OCR Capability:")
+        try:
+            import pytesseract
+            # Test with a simple image
+            from PIL import Image, ImageDraw, ImageFont
+            
+            # Create test image with text
+            img = Image.new('RGB', (200, 100), color='white')
+            draw = ImageDraw.Draw(img)
+            draw.text((10, 10), "Test OCR Text", fill='black')
+            
+            ocr_result = pytesseract.image_to_string(img).strip()
+            if ocr_result:
+                click.echo(f"✅ OCR working: '{ocr_result}'")
+            else:
+                click.echo("⚠️  OCR test returned empty result")
+                
+        except Exception as e:
+            click.echo(f"❌ OCR test failed: {e}")
+        
+        # macOS-specific permission checks
+        click.echo("\n🍎 macOS Permission Status:")
+        try:
+            import subprocess
+            
+            # Check screen recording permission using tccutil
+            result = subprocess.run([
+                'sqlite3', 
+                f'{os.path.expanduser("~")}/Library/Application Support/com.apple.TCC/TCC.db', 
+                "SELECT service, client, auth_value FROM access WHERE service='kTCCServiceScreenCapture';"
+            ], capture_output=True, text=True, timeout=5)
+            
+            if result.returncode == 0 and result.stdout:
+                click.echo("✅ Screen recording permissions found in TCC database")
+                # Parse and show relevant entries
+                for line in result.stdout.strip().split('\n'):
+                    if 'python' in line.lower() or 'terminal' in line.lower():
+                        click.echo(f"   {line}")
+            else:
+                click.echo("⚠️  No screen recording permissions found in TCC database")
+                
+        except Exception as e:
+            click.echo(f"⚠️  Could not check TCC permissions: {e}")
+        
+        # Recommendations
+        click.echo("\n💡 Recommendations:")
+        click.echo("1. Grant Screen Recording permission:")
+        click.echo("   System Preferences → Security & Privacy → Privacy → Screen Recording")
+        click.echo("   Add Terminal (or your Python environment) to the list")
+        click.echo("")
+        click.echo("2. If using a virtual environment, you may need to grant permissions to:")
+        click.echo(f"   Python executable: {sys.executable}")
+        click.echo("")
+        click.echo("3. After granting permissions, restart Terminal and try again")
+        click.echo("4. Test with: python -c \"import pyautogui; pyautogui.screenshot().show()\"")
+        
+    except Exception as e:
+        click.echo(f"❌ Diagnostic failed: {e}")
+        raise click.Abort()
 
 
 if __name__ == "__main__":

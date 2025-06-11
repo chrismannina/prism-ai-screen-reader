@@ -8,11 +8,14 @@ OCR processing, and basic activity classification.
 import asyncio
 import threading
 import time
+import tempfile
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
 import io
 import os
+import base64
+import json
 
 # Screen capture and image processing
 import pyautogui
@@ -34,6 +37,9 @@ except ImportError:
     MACOS_AVAILABLE = False
 
 from loguru import logger
+
+# Add OpenAI import
+import openai
 
 from ..core.config import PrismConfig
 from ..core.event_bus import EventBus, EventType
@@ -80,7 +86,7 @@ class WindowDetector:
                 'app_name': app_name,
                 'bundle_id': bundle_id,
                 'is_active': True,
-                'timestamp': datetime.now()
+                'timestamp': datetime.now().isoformat()  # Convert to ISO string for JSON serialization
             }
             
         except Exception as e:
@@ -100,7 +106,7 @@ class WindowDetector:
                             'app_name': proc_info['name'],
                             'bundle_id': None,
                             'is_active': True,
-                            'timestamp': datetime.now()
+                            'timestamp': datetime.now().isoformat()  # Convert to ISO string for JSON serialization
                         }
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
@@ -117,12 +123,42 @@ class ScreenCapture:
     def __init__(self, config: PrismConfig, security_manager: SecurityManager):
         self.config = config
         self.security_manager = security_manager
+        self._test_capture_method()
+    
+    def _test_capture_method(self):
+        """Test which screenshot capture method works best."""
+        self.use_macos_screencapture = False
+        
+        # On macOS, test if we can capture more than just desktop
+        if MACOS_AVAILABLE:
+            try:
+                # Test pyautogui capture
+                test_shot = pyautogui.screenshot()
+                test_array = np.array(test_shot)
+                unique_colors = len(np.unique(test_array.reshape(-1, test_array.shape[-1]), axis=0))
+                color_diversity = unique_colors / (test_array.shape[0] * test_array.shape[1])
+                
+                # If color diversity is very low, try alternative method
+                if color_diversity < 0.001:
+                    logger.warning("Low color diversity in pyautogui capture, will try macOS screencapture")
+                    self.use_macos_screencapture = True
+                else:
+                    logger.info(f"Using pyautogui capture (color diversity: {color_diversity:.6f})")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to test capture method: {e}")
     
     def capture_screenshot(self) -> Optional[Dict[str, Any]]:
         """Capture a screenshot and return processed data."""
         try:
-            # Capture screenshot
-            screenshot = pyautogui.screenshot()
+            # Try alternative macOS method first if needed
+            if self.use_macos_screencapture and MACOS_AVAILABLE:
+                screenshot = self._capture_screenshot_macos()
+            else:
+                screenshot = self._capture_screenshot_pyautogui()
+            
+            if not screenshot:
+                return None
             
             # Scale down if configured
             if self.config.capture.capture_resolution_scale < 1.0:
@@ -155,11 +191,60 @@ class ScreenCapture:
                 'resolution': (screenshot.width, screenshot.height),
                 'file_size': len(img_bytes),
                 'is_encrypted': self.config.privacy.encrypt_screenshots,
-                'timestamp': datetime.now()
+                'timestamp': datetime.now().isoformat()  # Convert to ISO string for JSON serialization
             }
             
         except Exception as e:
             logger.error(f"Screenshot capture failed: {e}")
+            return None
+    
+    def _capture_screenshot_pyautogui(self) -> Optional[Image.Image]:
+        """Capture screenshot using pyautogui."""
+        try:
+            return pyautogui.screenshot()
+        except Exception as e:
+            logger.error(f"pyautogui screenshot failed: {e}")
+            return None
+    
+    def _capture_screenshot_macos(self) -> Optional[Image.Image]:
+        """Capture screenshot using macOS screencapture command."""
+        try:
+            import subprocess
+            import tempfile
+            
+            # Create temporary file
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
+                tmp_path = tmp_file.name
+            
+            try:
+                # Use macOS screencapture command
+                result = subprocess.run([
+                    'screencapture', 
+                    '-x',  # Don't play camera sound
+                    '-t', 'png',  # PNG format
+                    tmp_path
+                ], capture_output=True, timeout=10)
+                
+                if result.returncode == 0:
+                    # Load the image
+                    screenshot = Image.open(tmp_path)
+                    # Make a copy since we'll delete the temp file
+                    screenshot_copy = screenshot.copy()
+                    screenshot.close()
+                    return screenshot_copy
+                else:
+                    logger.error(f"screencapture failed: {result.stderr.decode()}")
+                    return None
+                    
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(tmp_path)
+                except:
+                    pass
+                    
+        except Exception as e:
+            logger.error(f"macOS screencapture failed: {e}")
             return None
     
     def blur_sensitive_areas(self, image: Image.Image, ocr_data: Dict[str, Any]) -> Image.Image:
@@ -260,7 +345,7 @@ class OCRProcessor:
                 'confidence': avg_confidence,
                 'text_blocks': text_blocks,
                 'block_count': len(text_blocks),
-                'timestamp': datetime.now()
+                'timestamp': datetime.now().isoformat()  # Convert to ISO string for JSON serialization
             }
             
         except Exception as e:
@@ -359,7 +444,155 @@ class ActivityClassifier:
             'activity_type': best_activity,
             'confidence': confidence,
             'all_scores': activity_scores,
-            'timestamp': datetime.now()
+            'timestamp': datetime.now().isoformat()  # Convert to ISO string for JSON serialization
+        }
+
+
+class VisionActivityClassifier:
+    """Vision-based activity classification using OpenAI GPT-4 Vision."""
+    
+    def __init__(self, config: PrismConfig):
+        self.config = config
+        self.client = None
+        if config.ml.openai_api_key:
+            self.client = openai.OpenAI(api_key=config.ml.openai_api_key)
+        
+        # Define activity categories and descriptions
+        self.activity_categories = {
+            'coding': 'Writing, editing, or reviewing code in IDEs, editors, or terminals',
+            'browsing': 'Web browsing, reading websites, social media, or online research',
+            'writing': 'Creating documents, articles, emails, or other text content',
+            'communication': 'Video calls, messaging, email, or other communication tools',
+            'design': 'Creating or editing visual content, graphics, or design work',
+            'research': 'Reading academic papers, documentation, or research materials',
+            'presentation': 'Creating or viewing presentations, slides, or visual materials',
+            'media': 'Watching videos, listening to music, or consuming media content',
+            'gaming': 'Playing games or gaming-related activities',
+            'productivity': 'Task management, planning, or organizational activities',
+            'learning': 'Educational content, tutorials, courses, or learning materials',
+            'unknown': 'Unable to determine specific activity type'
+        }
+    
+    async def classify_activity(self, image_data: bytes) -> Dict[str, Any]:
+        """Classify activity based on screenshot using OpenAI Vision."""
+        if not self.client or not self.config.ml.use_vision_classification:
+            return self._fallback_classification()
+        
+        try:
+            # Convert image data to base64
+            base64_image = base64.b64encode(image_data).decode('utf-8')
+            
+            # Create the prompt for activity classification
+            prompt = self._create_classification_prompt()
+            
+            # Call OpenAI Vision API
+            response = await self._call_openai_vision(base64_image, prompt)
+            
+            if response:
+                return self._parse_response(response)
+            else:
+                return self._fallback_classification()
+                
+        except Exception as e:
+            logger.error(f"Vision classification error: {e}")
+            return self._fallback_classification()
+    
+    def _create_classification_prompt(self) -> str:
+        """Create the prompt for activity classification."""
+        categories_list = "\n".join([f"- {cat}: {desc}" for cat, desc in self.activity_categories.items()])
+        
+        return f"""
+Analyze this screenshot and classify the user's primary activity. Look at the interface, applications, content, and context clues.
+
+Available categories:
+{categories_list}
+
+Please respond with a JSON object containing:
+1. "activity_type": the most appropriate category from the list above
+2. "confidence": a confidence score from 0.0 to 1.0
+3. "reasoning": a brief explanation of why you chose this classification
+4. "details": specific observations that led to this classification (e.g., "VS Code interface with Python code visible")
+
+Focus on the dominant activity and what the user is actively doing, not just what's visible on screen.
+"""
+    
+    async def _call_openai_vision(self, base64_image: str, prompt: str) -> Optional[str]:
+        """Call OpenAI Vision API with the image and prompt."""
+        try:
+            response = await asyncio.to_thread(
+                self.client.chat.completions.create,
+                model=self.config.ml.vision_model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{base64_image}",
+                                    "detail": "low"  # Use "low" for faster processing
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=500,
+                temperature=0.1  # Low temperature for consistent classification
+            )
+            
+            return response.choices[0].message.content
+            
+        except Exception as e:
+            logger.error(f"OpenAI API error: {e}")
+            return None
+    
+    def _parse_response(self, response: str) -> Dict[str, Any]:
+        """Parse the OpenAI response and extract classification data."""
+        try:
+            # Try to extract JSON from the response
+            response_clean = response.strip()
+            if response_clean.startswith('```json'):
+                response_clean = response_clean[7:]
+            if response_clean.endswith('```'):
+                response_clean = response_clean[:-3]
+            
+            data = json.loads(response_clean)
+            
+            # Validate the response
+            activity_type = data.get('activity_type', 'unknown')
+            if activity_type not in self.activity_categories:
+                activity_type = 'unknown'
+            
+            confidence = float(data.get('confidence', 0.5))
+            confidence = max(0.0, min(1.0, confidence))  # Clamp between 0 and 1
+            
+            return {
+                'activity_type': activity_type,
+                'confidence': confidence,
+                'reasoning': data.get('reasoning', ''),
+                'details': data.get('details', ''),
+                'source': 'vision_classifier',
+                'timestamp': datetime.now().isoformat()
+            }
+            
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
+            logger.error(f"Failed to parse vision classification response: {e}")
+            logger.debug(f"Raw response: {response}")
+            return self._fallback_classification()
+    
+    def _fallback_classification(self) -> Dict[str, Any]:
+        """Return a fallback classification when vision analysis fails."""
+        return {
+            'activity_type': 'unknown',
+            'confidence': 0.3,
+            'reasoning': 'Vision classification failed',
+            'details': 'Could not analyze screenshot',
+            'source': 'vision_classifier_fallback',
+            'timestamp': datetime.now().isoformat()
         }
 
 
@@ -378,6 +611,7 @@ class ObserverAgent:
         self.screen_capture = ScreenCapture(config, security_manager)
         self.ocr_processor = OCRProcessor(config, security_manager)
         self.activity_classifier = ActivityClassifier(config)
+        self.vision_activity_classifier = VisionActivityClassifier(config)
         
         # State
         self.is_running = False
@@ -505,54 +739,136 @@ class ObserverAgent:
         self.last_screenshot_time = datetime.now()
     
     async def _process_screenshot_ocr(self, screenshot_id: int, screenshot_data: Dict[str, Any]) -> None:
-        """Process OCR for a screenshot."""
+        """Process OCR for a screenshot and classify activity using both text and vision methods."""
         try:
-            ocr_data = self.ocr_processor.process_image(
-                screenshot_data['image_data'],
-                screenshot_data['is_encrypted']
+            # Process OCR if enabled
+            ocr_data = None
+            if self.config.capture.ocr_enabled:
+                ocr_data = self.ocr_processor.process_image(
+                    screenshot_data['image_data'],
+                    screenshot_data['is_encrypted']
+                )
+                
+                if ocr_data:
+                    # Emit OCR completed event
+                    await self.event_bus.emit(
+                        EventType.OCR_COMPLETED,
+                        data={
+                            'screenshot_id': screenshot_id,
+                            'text_length': len(ocr_data['text']),
+                            'confidence': ocr_data['confidence'],
+                            'block_count': ocr_data['block_count']
+                        },
+                        source='observer_agent'
+                    )
+            
+            # Get window information
+            window_info = self.window_detector.get_active_window_info()
+            
+            # Try vision-based classification first (if enabled and API key available)
+            vision_activity_data = None
+            if (self.config.ml.use_vision_classification and 
+                self.config.ml.openai_api_key and 
+                self.vision_activity_classifier.client):
+                
+                try:
+                    # Get unencrypted image data for vision analysis
+                    image_data_for_vision = screenshot_data['image_data']
+                    if screenshot_data['is_encrypted']:
+                        # Decrypt for analysis (but keep original encrypted for storage)
+                        image_data_for_vision = self.security_manager.decrypt_data(image_data_for_vision)
+                    
+                    if image_data_for_vision:
+                        vision_activity_data = await self.vision_activity_classifier.classify_activity(image_data_for_vision)
+                        logger.info(f"Vision classification: {vision_activity_data['activity_type']} "
+                                   f"(confidence: {vision_activity_data['confidence']:.2f})")
+                
+                except Exception as e:
+                    logger.warning(f"Vision classification failed, falling back to text-based: {e}")
+            
+            # Text-based classification as fallback or comparison
+            text_activity_data = self.activity_classifier.classify_activity(window_info, ocr_data)
+            
+            # Choose the best classification result
+            final_activity_data = self._select_best_classification(vision_activity_data, text_activity_data)
+            
+            # Store activity
+            activity_id = self.database.store_activity(
+                activity_type=final_activity_data['activity_type'],
+                confidence=final_activity_data['confidence'],
+                screenshot_id=screenshot_id,
+                metadata=final_activity_data
             )
             
-            if ocr_data:
-                # Update screenshot with OCR data
-                # (This would require updating the database schema)
-                
-                # Emit OCR completed event
-                await self.event_bus.emit(
-                    EventType.OCR_COMPLETED,
-                    data={
-                        'screenshot_id': screenshot_id,
-                        'text_length': len(ocr_data['text']),
-                        'confidence': ocr_data['confidence'],
-                        'block_count': ocr_data['block_count']
-                    },
-                    source='observer_agent'
-                )
-                
-                # Classify activity
-                window_info = self.window_detector.get_active_window_info()
-                activity_data = self.activity_classifier.classify_activity(window_info, ocr_data)
-                
-                # Store activity
-                activity_id = self.database.store_activity(
-                    activity_type=activity_data['activity_type'],
-                    confidence=activity_data['confidence'],
-                    screenshot_id=screenshot_id,
-                    metadata=activity_data
-                )
-                
-                # Emit activity classified event
-                await self.event_bus.emit(
-                    EventType.ACTIVITY_CLASSIFIED,
-                    data={
-                        'activity_id': activity_id,
-                        'activity_type': activity_data['activity_type'],
-                        'confidence': activity_data['confidence']
-                    },
-                    source='observer_agent'
-                )
+            # Emit activity classified event
+            await self.event_bus.emit(
+                EventType.ACTIVITY_CLASSIFIED,
+                data={
+                    'activity_id': activity_id,
+                    'activity_type': final_activity_data['activity_type'],
+                    'confidence': final_activity_data['confidence'],
+                    'classification_source': final_activity_data.get('source', 'unknown')
+                },
+                source='observer_agent'
+            )
                 
         except Exception as e:
-            logger.error(f"OCR processing error: {e}")
+            logger.error(f"Screenshot processing error: {e}")
+    
+    def _select_best_classification(self, 
+                                   vision_data: Optional[Dict[str, Any]], 
+                                   text_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Select the best classification result from vision and text methods."""
+        
+        # If vision classification is not available, use text
+        if not vision_data:
+            text_data['source'] = 'text_classifier'
+            return text_data
+        
+        # Compare confidence scores and method reliability
+        vision_confidence = vision_data.get('confidence', 0.0)
+        text_confidence = text_data.get('confidence', 0.0)
+        
+        # Vision classification tends to be more accurate for UI detection
+        # But text classification might catch specific keywords
+        
+        # Use vision if it has reasonable confidence and is not 'unknown'
+        if (vision_confidence >= self.config.ml.vision_confidence_threshold and 
+            vision_data.get('activity_type') != 'unknown'):
+            
+            # Add comparison info to metadata
+            vision_data['text_classification'] = {
+                'activity_type': text_data['activity_type'],
+                'confidence': text_data['confidence']
+            }
+            vision_data['source'] = 'vision_classifier'
+            return vision_data
+        
+        # Use text classification if vision failed or has low confidence
+        elif text_confidence >= self.config.ml.confidence_threshold:
+            text_data['vision_classification'] = {
+                'activity_type': vision_data.get('activity_type', 'unknown'),
+                'confidence': vision_data.get('confidence', 0.0)
+            }
+            text_data['source'] = 'text_classifier'
+            return text_data
+        
+        # If both have low confidence, prefer vision if available
+        elif vision_confidence > text_confidence:
+            vision_data['text_classification'] = {
+                'activity_type': text_data['activity_type'],
+                'confidence': text_data['confidence']
+            }
+            vision_data['source'] = 'vision_classifier_low_confidence'
+            return vision_data
+        
+        else:
+            text_data['vision_classification'] = {
+                'activity_type': vision_data.get('activity_type', 'unknown'),
+                'confidence': vision_data.get('confidence', 0.0)
+            }
+            text_data['source'] = 'text_classifier_fallback'
+            return text_data
     
     async def _check_active_window(self) -> None:
         """Check and update active window information."""

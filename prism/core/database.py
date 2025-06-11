@@ -344,11 +344,15 @@ class DatabaseManager:
             
             with self.get_session() as session:
                 activities = session.query(Activity)\
+                    .outerjoin(Activity.window_info)\
+                    .outerjoin(Activity.screenshot)\
                     .filter(Activity.timestamp >= cutoff_time)\
                     .order_by(Activity.timestamp.desc())\
                     .limit(limit)\
                     .all()
                 
+                # Detach from session to avoid lazy loading issues
+                session.expunge_all()
                 return activities
                 
         except SQLAlchemyError as e:

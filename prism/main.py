@@ -9,6 +9,7 @@ import asyncio
 import signal
 import sys
 import os
+import psutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -20,6 +21,7 @@ from .core.config import PrismConfig
 from .core.database import DatabaseManager, WindowInfo, Screenshot
 from .core.event_bus import EventBus, EventType, get_event_bus
 from .core.security import SecurityManager
+from .core.api_monitor import APIMonitor
 from .agents.observer import ObserverAgent
 
 
@@ -32,6 +34,7 @@ class PrismApp:
         self.event_bus = get_event_bus()
         self.security_manager = SecurityManager(self.config)
         self.database = DatabaseManager(self.config)
+        self.api_monitor = APIMonitor(self.config)
         
         # Initialize agents
         self.observer_agent = ObserverAgent(
@@ -47,6 +50,7 @@ class PrismApp:
         # State
         self.is_running = False
         self._shutdown_event = asyncio.Event()
+        self._pid_file = self.config.get_data_directory() / "prism.pid"
         
         logger.info("Prism application initialized")
     
@@ -83,8 +87,16 @@ class PrismApp:
             logger.warning("Prism is already running")
             return
         
+        # Check if another instance is already running
+        if self._is_already_running():
+            logger.error("Another Prism instance is already running")
+            raise RuntimeError("Another Prism instance is already running")
+        
         try:
             logger.info("Starting Prism...")
+            
+            # Create PID file
+            self._create_pid_file()
             
             # Start event bus
             await self.event_bus.start()
@@ -103,6 +115,7 @@ class PrismApp:
                 data={
                     'app': 'prism',
                     'version': '0.1.0',
+                    'pid': os.getpid(),
                     'config': {
                         'screenshot_interval': self.config.capture.screenshot_interval_seconds,
                         'ocr_enabled': self.config.capture.ocr_enabled,
@@ -116,6 +129,7 @@ class PrismApp:
             
         except Exception as e:
             logger.error(f"Failed to start Prism: {e}")
+            self._cleanup_pid_file()
             await self.stop()
             raise
     
@@ -139,6 +153,9 @@ class PrismApp:
             # Cleanup security data
             self.security_manager.cleanup_security_data()
             
+            # Remove PID file
+            self._cleanup_pid_file()
+            
             self.is_running = False
             self._shutdown_event.set()
             
@@ -146,6 +163,92 @@ class PrismApp:
             
         except Exception as e:
             logger.error(f"Error during shutdown: {e}")
+    
+    def _create_pid_file(self) -> None:
+        """Create a PID file to track the running process."""
+        try:
+            self._pid_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._pid_file, 'w') as f:
+                f.write(str(os.getpid()))
+            logger.debug(f"Created PID file: {self._pid_file}")
+        except Exception as e:
+            logger.warning(f"Could not create PID file: {e}")
+    
+    def _cleanup_pid_file(self) -> None:
+        """Remove the PID file."""
+        try:
+            if self._pid_file.exists():
+                self._pid_file.unlink()
+                logger.debug(f"Removed PID file: {self._pid_file}")
+        except Exception as e:
+            logger.warning(f"Could not remove PID file: {e}")
+    
+    def _is_already_running(self) -> bool:
+        """Check if another Prism instance is already running."""
+        if not self._pid_file.exists():
+            return False
+        
+        try:
+            with open(self._pid_file, 'r') as f:
+                pid = int(f.read().strip())
+            
+            # Check if the process is still running
+            if psutil.pid_exists(pid):
+                try:
+                    process = psutil.Process(pid)
+                    # Check if it's actually a Prism process
+                    if 'prism' in ' '.join(process.cmdline()).lower():
+                        return True
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            
+            # PID file exists but process is dead, clean it up
+            self._cleanup_pid_file()
+            return False
+            
+        except (ValueError, FileNotFoundError):
+            # Invalid PID file, clean it up
+            self._cleanup_pid_file()
+            return False
+    
+    @classmethod
+    def is_running_externally(cls, config_file: Optional[str] = None) -> dict:
+        """Check if Prism is running without creating a new instance."""
+        config = PrismConfig(config_file)
+        pid_file = config.get_data_directory() / "prism.pid"
+        
+        result = {
+            'is_running': False,
+            'pid': None,
+            'process_info': None
+        }
+        
+        if not pid_file.exists():
+            return result
+        
+        try:
+            with open(pid_file, 'r') as f:
+                pid = int(f.read().strip())
+            
+            if psutil.pid_exists(pid):
+                try:
+                    process = psutil.Process(pid)
+                    if 'prism' in ' '.join(process.cmdline()).lower():
+                        result['is_running'] = True
+                        result['pid'] = pid
+                        result['process_info'] = {
+                            'command': ' '.join(process.cmdline()),
+                            'create_time': datetime.fromtimestamp(process.create_time()),
+                            'cpu_percent': process.cpu_percent(),
+                            'memory_mb': process.memory_info().rss / 1024 / 1024
+                        }
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        
+        except (ValueError, FileNotFoundError):
+            pass
+        
+        return result
     
     def _setup_event_handlers(self) -> None:
         """Setup event handlers for system events."""
@@ -265,36 +368,70 @@ def status(ctx):
     config_file = ctx.obj.get('config')
     
     try:
-        app = PrismApp(config_file)
-        status_info = app.get_status()
+        # Check if Prism is running externally
+        running_info = PrismApp.is_running_externally(config_file)
+        
+        # Get database and config info
+        config = PrismConfig(config_file)
+        database = DatabaseManager(config)
+        security_manager = SecurityManager(config)
+        api_monitor = APIMonitor(config)
+        
+        db_stats = database.get_database_stats()
+        security_status = security_manager.get_security_status()
+        api_status = api_monitor.get_status()
         
         click.echo("🔍 Prism Status")
         click.echo("=" * 50)
-        click.echo(f"Running: {'✅ Yes' if status_info['is_running'] else '❌ No'}")
-        click.echo(f"Config File: {status_info['config_file']}")
         
-        if status_info['observer_agent']:
-            agent_status = status_info['observer_agent']
-            click.echo(f"\n📸 Observer Agent:")
-            click.echo(f"  Running: {'✅ Yes' if agent_status['is_running'] else '❌ No'}")
-            click.echo(f"  Last Screenshot: {agent_status['last_screenshot_time'] or 'Never'}")
-            click.echo(f"  Current Window: {agent_status['current_window'] or 'None'}")
+        # Show running status with process info
+        if running_info['is_running']:
+            process_info = running_info['process_info']
+            click.echo(f"Running: ✅ Yes (PID: {running_info['pid']})")
+            click.echo(f"Started: {process_info['create_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+            click.echo(f"CPU Usage: {process_info['cpu_percent']:.1f}%")
+            click.echo(f"Memory: {process_info['memory_mb']:.1f} MB")
+        else:
+            click.echo("Running: ❌ No")
         
-        if status_info['database']:
-            db_stats = status_info['database']
-            click.echo(f"\n🗄️  Database:")
-            click.echo(f"  Screenshots: {db_stats.get('screenshots_count', 0)}")
-            click.echo(f"  Activities: {db_stats.get('activities_count', 0)}")
-            click.echo(f"  Size: {db_stats.get('database_size_mb', 0):.1f} MB")
+        click.echo(f"Config File: {config.config_file}")
         
-        if status_info['security']:
-            security_status = status_info['security']
-            click.echo(f"\n🔐 Security:")
-            click.echo(f"  Encryption: {'✅ Enabled' if security_status['encryption_enabled'] else '❌ Disabled'}")
-            click.echo(f"  Excluded Apps: {security_status['excluded_apps_count']}")
+        # Show database stats
+        click.echo(f"\n🗄️  Database:")
+        click.echo(f"  Screenshots: {db_stats.get('screenshots_count', 0):,}")
+        click.echo(f"  Activities: {db_stats.get('activities_count', 0):,}")
+        click.echo(f"  Window Records: {db_stats.get('window_info_count', 0):,}")
+        click.echo(f"  Size: {db_stats.get('database_size_mb', 0):.1f} MB")
+        
+        # Show security status
+        click.echo(f"\n🔐 Security:")
+        click.echo(f"  Encryption: {'✅ Enabled' if security_status['encryption_enabled'] else '❌ Disabled'}")
+        click.echo(f"  Excluded Apps: {security_status['excluded_apps_count']}")
+        
+        # Show API monitoring status
+        if config.ml.api_monitoring_enabled:
+            click.echo(f"\n💰 API Usage (OpenAI):")
+            daily = api_status['daily_usage']
+            monthly = api_status['monthly_usage']
             
+            # Daily usage
+            daily_icon = "🟢" if daily['percentage'] < 50 else "🟡" if daily['percentage'] < 80 else "🔴"
+            click.echo(f"  Today: {daily_icon} ${daily['cost_usd']:.3f} / ${daily['limit_usd']:.2f} ({daily['percentage']:.1f}%)")
+            click.echo(f"         {daily['calls']} calls, {daily['tokens']:,} tokens")
+            
+            # Monthly usage
+            monthly_icon = "🟢" if monthly['percentage'] < 50 else "🟡" if monthly['percentage'] < 80 else "🔴"
+            click.echo(f"  Month: {monthly_icon} ${monthly['cost_usd']:.3f} / ${monthly['limit_usd']:.2f} ({monthly['percentage']:.1f}%)")
+            click.echo(f"         {monthly['calls']} calls, {monthly['tokens']:,} tokens")
+            
+            click.echo(f"  Success Rate: {api_status['success_rate_24h']:.1%}")
+        
+        # Close connections
+        database.close()
+        
     except Exception as e:
         click.echo(f"❌ Error getting status: {e}")
+        logger.error(f"Status command error: {e}")
 
 
 @cli.command()

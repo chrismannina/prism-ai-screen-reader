@@ -45,6 +45,7 @@ from ..core.config import PrismConfig
 from ..core.event_bus import EventBus, EventType
 from ..core.database import DatabaseManager
 from ..core.security import SecurityManager
+from ..core.api_monitor import APIMonitor
 
 
 class WindowDetector:
@@ -454,6 +455,8 @@ class VisionActivityClassifier:
     def __init__(self, config: PrismConfig):
         self.config = config
         self.client = None
+        self.api_monitor = APIMonitor(config)
+        
         if config.ml.openai_api_key:
             self.client = openai.OpenAI(api_key=config.ml.openai_api_key)
         
@@ -463,39 +466,101 @@ class VisionActivityClassifier:
             'browsing': 'Web browsing, reading websites, social media, or online research',
             'writing': 'Creating documents, articles, emails, or other text content',
             'communication': 'Video calls, messaging, email, or other communication tools',
-            'design': 'Creating or editing visual content, graphics, or design work',
-            'research': 'Reading academic papers, documentation, or research materials',
-            'presentation': 'Creating or viewing presentations, slides, or visual materials',
-            'media': 'Watching videos, listening to music, or consuming media content',
-            'gaming': 'Playing games or gaming-related activities',
-            'productivity': 'Task management, planning, or organizational activities',
-            'learning': 'Educational content, tutorials, courses, or learning materials',
-            'unknown': 'Unable to determine specific activity type'
+            'productivity': 'Task management, spreadsheets, presentations, or general productivity apps',
+            'entertainment': 'Gaming, watching videos, streaming, or other entertainment activities',
+            'design': 'Graphic design, photo editing, or creative work',
+            'unknown': 'Activity cannot be clearly classified into other categories'
         }
+        
+        logger.info(f"Vision Activity Classifier initialized with {len(self.activity_categories)} categories")
     
     async def classify_activity(self, image_data: bytes) -> Dict[str, Any]:
-        """Classify activity based on screenshot using OpenAI Vision."""
-        if not self.client or not self.config.ml.use_vision_classification:
+        """Classify activity from screenshot image data."""
+        if not self.client:
+            logger.warning("OpenAI client not available, returning fallback classification")
             return self._fallback_classification()
         
         try:
-            # Convert image data to base64
+            start_time = time.time()
+            
+            # Convert image to base64
             base64_image = base64.b64encode(image_data).decode('utf-8')
             
-            # Create the prompt for activity classification
+            # Create classification prompt
             prompt = self._create_classification_prompt()
             
             # Call OpenAI Vision API
             response = await self._call_openai_vision(base64_image, prompt)
+            response_time_ms = int((time.time() - start_time) * 1000)
             
             if response:
-                return self._parse_response(response)
+                # Parse response and get classification
+                result = self._parse_response(response)
+                
+                # Log successful API usage (estimate tokens)
+                input_tokens = self._estimate_input_tokens(prompt, base64_image)
+                output_tokens = self._estimate_output_tokens(response)
+                
+                self.api_monitor.log_usage(
+                    provider='openai',
+                    model=self.config.ml.vision_model,
+                    operation='vision_classification',
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    response_time_ms=response_time_ms,
+                    success=True
+                )
+                
+                return result
             else:
+                # Log failed API usage
+                self.api_monitor.log_usage(
+                    provider='openai',
+                    model=self.config.ml.vision_model,
+                    operation='vision_classification',
+                    input_tokens=0,
+                    output_tokens=0,
+                    response_time_ms=response_time_ms,
+                    success=False,
+                    error_message="No response from OpenAI API"
+                )
+                
                 return self._fallback_classification()
                 
         except Exception as e:
             logger.error(f"Vision classification error: {e}")
+            
+            # Log failed API usage
+            response_time_ms = int((time.time() - start_time) * 1000) if 'start_time' in locals() else 0
+            self.api_monitor.log_usage(
+                provider='openai',
+                model=self.config.ml.vision_model,
+                operation='vision_classification',
+                input_tokens=0,
+                output_tokens=0,
+                response_time_ms=response_time_ms,
+                success=False,
+                error_message=str(e)
+            )
+            
             return self._fallback_classification()
+    
+    def _estimate_input_tokens(self, prompt: str, base64_image: str) -> int:
+        """Estimate input tokens for the API call."""
+        # Text tokens (roughly 4 characters per token)
+        text_tokens = len(prompt) // 4
+        
+        # Image tokens (GPT-4 Vision pricing)
+        # For images, OpenAI charges based on image size
+        # Rough estimate: ~765 tokens for a typical screenshot
+        image_tokens = 765
+        
+        return text_tokens + image_tokens
+    
+    def _estimate_output_tokens(self, response: str) -> int:
+        """Estimate output tokens from the response."""
+        # Roughly 4 characters per token
+        return len(response) // 4
     
     def _create_classification_prompt(self) -> str:
         """Create the prompt for activity classification."""
@@ -597,7 +662,12 @@ Focus on the dominant activity and what the user is actively doing, not just wha
 
 
 class ObserverAgent:
-    """Main Observer Agent that coordinates all monitoring activities."""
+    """
+    Observer Agent
+    
+    Continuously monitors system state through screenshot capture, window detection,
+    and OCR processing. Coordinates activity classification and data storage.
+    """
     
     def __init__(self, config: PrismConfig, event_bus: EventBus, 
                  database: DatabaseManager, security_manager: SecurityManager):
@@ -613,15 +683,19 @@ class ObserverAgent:
         self.activity_classifier = ActivityClassifier(config)
         self.vision_activity_classifier = VisionActivityClassifier(config)
         
-        # State
+        # State tracking
         self.is_running = False
+        self.screenshot_task = None
+        self.window_monitoring_task = None
         self.last_screenshot_time = None
         self.last_window_check_time = None
         self.current_session_id = None
         
-        # Tasks
-        self._screenshot_task = None
-        self._window_monitoring_task = None
+        # Activity session tracking
+        self.current_activity_session = None
+        self.last_activity_type = None
+        self.activity_session_start_time = None
+        self._activity_change_threshold = 0.1  # Confidence threshold for activity changes
         
         logger.info("Observer Agent initialized")
     
@@ -792,10 +866,14 @@ class ObserverAgent:
             # Choose the best classification result
             final_activity_data = self._select_best_classification(vision_activity_data, text_activity_data)
             
+            # Calculate duration for this activity
+            duration_seconds = await self._calculate_activity_duration(final_activity_data)
+            
             # Store activity
             activity_id = self.database.store_activity(
                 activity_type=final_activity_data['activity_type'],
                 confidence=final_activity_data['confidence'],
+                duration_seconds=duration_seconds,
                 screenshot_id=screenshot_id,
                 metadata=final_activity_data
             )
@@ -807,6 +885,7 @@ class ObserverAgent:
                     'activity_id': activity_id,
                     'activity_type': final_activity_data['activity_type'],
                     'confidence': final_activity_data['confidence'],
+                    'duration_seconds': duration_seconds,
                     'classification_source': final_activity_data.get('source', 'unknown')
                 },
                 source='observer_agent'
@@ -814,6 +893,36 @@ class ObserverAgent:
                 
         except Exception as e:
             logger.error(f"Screenshot processing error: {e}")
+    
+    async def _calculate_activity_duration(self, activity_data: Dict[str, Any]) -> int:
+        """Calculate duration for the current activity based on session tracking."""
+        current_time = datetime.now()
+        activity_type = activity_data['activity_type']
+        confidence = activity_data['confidence']
+        
+        # If this is the first activity or a different activity type
+        if (self.last_activity_type != activity_type or 
+            self.activity_session_start_time is None):
+            
+            # End previous session if it exists
+            if self.last_activity_type and self.activity_session_start_time:
+                previous_duration = int((current_time - self.activity_session_start_time).total_seconds())
+                logger.debug(f"Ending {self.last_activity_type} session after {previous_duration}s")
+            
+            # Start new session
+            self.last_activity_type = activity_type
+            self.activity_session_start_time = current_time
+            
+            # For the first occurrence of an activity, duration is the screenshot interval
+            duration_seconds = self.config.capture.screenshot_interval_seconds
+            logger.debug(f"Starting new {activity_type} session")
+            
+        else:
+            # Continuing same activity - calculate duration since session started
+            duration_seconds = int((current_time - self.activity_session_start_time).total_seconds())
+            logger.debug(f"Continuing {activity_type} session - total duration: {duration_seconds}s")
+        
+        return duration_seconds
     
     def _select_best_classification(self, 
                                    vision_data: Optional[Dict[str, Any]], 

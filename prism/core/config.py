@@ -66,6 +66,12 @@ class MLSettings:
     vision_model: str = "gpt-4o-mini"
     vision_confidence_threshold: float = 0.7
     fallback_to_text_classification: bool = True
+    
+    # API monitoring and cost management
+    api_daily_limit_usd: float = 5.0
+    api_monthly_limit_usd: float = 50.0
+    api_alert_threshold: float = 0.8  # Alert at 80% of limit
+    api_monitoring_enabled: bool = True
 
 
 @dataclass
